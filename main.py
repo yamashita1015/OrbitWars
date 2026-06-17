@@ -110,6 +110,10 @@ class ProducerLiteConfig:
     terminal_roi_threshold: float = 1.0
     terminal_max_waves_per_turn: int = 9
     terminal_enable_regroup: bool = False
+    # Opening phase (first N turns: aggressive neutral expansion)
+    opening_phase_turns: int = 60
+    opening_roi_threshold: float = 1.15
+    opening_max_waves_per_turn: int = 8
 
 
 def _movement_config(config: ProducerLiteConfig, *, player_count: int) -> MovementConfig:
@@ -291,6 +295,21 @@ def _apply_phase_config(config: ProducerLiteConfig, step: int) -> ProducerLiteCo
             roi_threshold=float(config.terminal_roi_threshold),
             max_waves_per_turn=int(config.terminal_max_waves_per_turn),
             enable_regroup=bool(config.terminal_enable_regroup),
+        )
+    return config
+
+
+def _apply_opening_config(config: ProducerLiteConfig, step: int) -> ProducerLiteConfig:
+    """Override config for the opening phase (first opening_phase_turns turns).
+
+    Lower ROI and more waves to aggressively grab neutral planets early.
+    Applied after _adjust_config; terminal phase always overrides this.
+    """
+    if int(step) < int(config.opening_phase_turns):
+        return dataclasses.replace(
+            config,
+            roi_threshold=float(config.opening_roi_threshold),
+            max_waves_per_turn=int(config.opening_max_waves_per_turn),
         )
     return config
 
@@ -779,6 +798,7 @@ def run_turn(obs_tensors: dict, *, config: ProducerLiteConfig, player_count: int
     config = _adjust_config(
         config, obs=obs, prod=movement.planet_prod, step=step, player_count=int(player_count)
     )
+    config = _apply_opening_config(config, step)
     config = _apply_phase_config(config, step)
     cache = build_distance_cache(movement, max_k=int(config.horizon))
     H = int(config.horizon)
