@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# 仮想環境
+.venv/
+
+# 生成物
+submission.tar.gz
+
+# 作業用一時ファイル
+main_backup.py
+compare_versions.py
+compare_fracs.py
+
+# 他者の公開コード
+public_code/
+orbit-wars-i-m-stronger.ipynb
+getting-started.ipynb
+
+# Claude Code設定
+.claude/
+
+# Kaggle notebook出力キャッシュ
+.ipynb_checkpoints/
