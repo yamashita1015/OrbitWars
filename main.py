@@ -82,6 +82,29 @@ class ProducerLiteConfig:
     regroup_time_penalty_weight: float = 1e-3
     ffa_leader_attack_bonus: float = 0.0
     ffa_target_prod_bonus: float = 0.0
+    # Dynamic scaling
+    min_roi: float = 1.05
+    max_roi: float = 1.45
+    horizon_min: int = 8
+    horizon_max: int = 24
+    beta_min: float = 1.2
+    beta_max: float = 3.5
+    # Production snowball
+    prod_rush_steps: int = 120
+    prod_rush_top_k: int = 3
+    prod_rush_roi_discount: float = 0.80
+    # Shrinking ring conquest
+    enable_ring_conquest: bool = True
+    ring_inner_boost: float = 1.3
+    ring_outer_penalty: float = 0.7
+    ring_min_radius_frac: float = 0.15
+    # Committed-fleet penalty (1.0 = disabled; <1.0 penalises re-targeting)
+    committed_fleet_penalty: float = 1.0
+    # Proactive defense
+    enable_proactive_defense: bool = True
+    defense_threat_horizon: float = 14.0
+    defense_min_intercept_margin: float = 1.05
+    defense_max_waves: int = 3
 
 
 def _movement_config(config: ProducerLiteConfig, *, player_count: int) -> MovementConfig:
@@ -179,32 +202,39 @@ def _adjust_config(
     step: int,
     player_count: int,
 ) -> ProducerLiteConfig:
-    """Continuously lower ROI and add waves when losing; restore when winning."""
+    """Dynamically adjust ROI, horizon, beta, waves based on relative strength."""
     pid = int(obs.player_id)
     strength = _owner_strength(obs, prod, int(player_count))
-    if pid < 0 or pid >= int(player_count):
+    if pid < 0 or pid >= int(player_count) or strength.numel() == 0:
         return config
 
     my = float(strength[pid].item())
     leader = float(strength.max().item())
     ratio = my / max(leader, 1e-6)
+    remaining = TOTAL_STEPS - int(step)
 
-    new_roi = float(config.roi_threshold)
-    if ratio < 1.0:
-        deficit = 1.0 - ratio
-        new_roi = max(1.10, new_roi - 0.25 * deficit * deficit)  # quadratic drop
-        remaining = TOTAL_STEPS - step
-        if remaining < 150 and ratio < 0.90:
-            time_urgency = (150 - remaining) / 150.0
-            new_roi = max(1.10, new_roi - 0.10 * time_urgency * deficit)
+    # Only adjust when behind — when winning, preserve base behaviour
+    if ratio >= 1.0:
+        return config
 
+    deficit = 1.0 - ratio
+
+    # Dynamic ROI: drop toward min_roi the more we're losing
+    roi_drop = 0.30 * (1.0 - torch.exp(torch.tensor(-3.0 * deficit)).item())
+    if remaining < 150 and ratio < 0.90:
+        roi_drop += 0.12 * ((150 - remaining) / 150.0) * deficit
+    new_roi = max(float(config.min_roi), float(config.roi_threshold) - roi_drop)
+    config = dataclasses.replace(config, roi_threshold=new_roi)
+
+    # Dynamic waves: more when heavily behind or time running out
     base_waves = int(config.max_waves_per_turn)
     if ratio < 0.70:
-        base_waves = min(7, base_waves + 1)
-    if (TOTAL_STEPS - step) < 100 and ratio < 0.95:
-        base_waves = min(7, base_waves + 1)
+        base_waves = min(8, base_waves + 1)
+    if remaining < 100 and ratio < 0.95:
+        base_waves = min(8, base_waves + 1)
+    config = dataclasses.replace(config, max_waves_per_turn=base_waves)
 
-    return dataclasses.replace(config, roi_threshold=new_roi, max_waves_per_turn=base_waves)
+    return config
 
 
 def _suppress_late_candidates(
@@ -243,6 +273,227 @@ def _suppress_late_candidates(
     return torch.where(too_late, torch.full_like(score, float("-inf")), score)
 
 
+def _apply_prod_snowball_boost(
+    *,
+    score: Tensor,
+    obs,
+    target_idx: Tensor,
+    cand_tgt_short: Tensor,
+    prod: Tensor,
+    step: int,
+    config: ProducerLiteConfig,
+) -> Tensor:
+    """Boost top-k highest-production neutral targets in the early game."""
+    if int(step) > int(config.prod_rush_steps):
+        return score
+    P = int(obs.P)
+    device = score.device
+    dtype = score.dtype
+    neutral_mask = obs.owner_abs < 0
+    if not bool(neutral_mask.any()):
+        return score
+    prod_neutral = torch.where(
+        neutral_mask & obs.alive, prod.to(dtype),
+        torch.zeros(P, dtype=dtype, device=device),
+    )
+    top_k = min(int(config.prod_rush_top_k), int(prod_neutral.numel()))
+    if top_k == 0:
+        return score
+    top_vals = torch.topk(prod_neutral, top_k).values
+    threshold = float(top_vals[-1].item())
+    tgt_abs = target_idx[cand_tgt_short].clamp(0, P - 1)
+    tgt_prod = prod.to(dtype)[tgt_abs]
+    tgt_neutral = obs.owner_abs[tgt_abs] < 0
+    is_top = tgt_neutral & (tgt_prod >= threshold - 1e-6)
+    boost = 1.0 / float(config.prod_rush_roi_discount)
+    return torch.where(is_top.reshape(score.shape), score * boost, score)
+
+
+def _ring_conquest_multiplier(
+    *,
+    obs,
+    target_idx: Tensor,
+    config: ProducerLiteConfig,
+    step: int,
+) -> Tensor:
+    """Score multiplier per target based on a shrinking conquest ring.
+
+    Targets inside the ring (centred on owned-planet centroid, shrinking over
+    time) get ring_inner_boost; targets outside get ring_outer_penalty.
+    This biases the agent toward completing a compact front before over-extending.
+    """
+    P = int(obs.P)
+    device = obs.device
+    dtype = obs.ships.dtype
+    ones = torch.ones(int(target_idx.shape[0]), dtype=dtype, device=device)
+
+    if not config.enable_ring_conquest:
+        return ones
+
+    owned = obs.owned & obs.alive
+    if not bool(owned.any()):
+        return ones
+
+    pos = torch.stack([obs.x, obs.y], dim=1).to(dtype)  # [P, 2]
+    w = obs.ships.to(dtype)[owned]
+    centre = (pos[owned] * w.unsqueeze(1)).sum(0) / (w.sum() + 1e-6)  # [2]
+
+    alive_pos = pos[obs.alive]
+    dists_from_centre = torch.norm(alive_pos - centre, dim=1)
+    map_radius = float(dists_from_centre.max().item()) if dists_from_centre.numel() > 0 else 1.0
+
+    min_r = float(config.ring_min_radius_frac) * map_radius
+    t = min(float(step) / TOTAL_STEPS, 1.0)
+    ring_radius = map_radius * (1.0 - t) + min_r * t
+
+    tgt_pos = pos[target_idx.clamp(0, P - 1)]            # [T, 2]
+    tgt_dist = torch.norm(tgt_pos - centre.unsqueeze(0), dim=1)  # [T]
+
+    inside = tgt_dist <= ring_radius
+    return torch.where(
+        inside,
+        torch.full_like(tgt_dist, float(config.ring_inner_boost)),
+        torch.full_like(tgt_dist, float(config.ring_outer_penalty)),
+    )
+
+
+def _build_defense_entries(
+    *,
+    movement: PlanetMovement,
+    obs,
+    cache,
+    config: ProducerLiteConfig,
+    player_count: int,
+) -> "LaunchEntries":
+    """Send reinforcements to owned planets projected to fall in defense_threat_horizon turns.
+
+    Picks the nearest owned source that can arrive in time and has surplus ships.
+    Caps at defense_max_waves per turn to avoid over-consuming the garrison.
+    """
+    from orbit_lite.movement_step import LaunchEntries  # noqa: F401 (type hint only)
+    P = int(obs.P)
+    device = obs.device
+    dtype = obs.ships.dtype
+    pid = int(obs.player_id)
+
+    if not config.enable_proactive_defense or P == 0:
+        return _empty_entries(device, dtype)
+
+    owned = obs.owned & obs.alive
+    if not bool(owned.any()):
+        return _empty_entries(device, dtype)
+
+    H = min(int(config.defense_threat_horizon),
+            int(movement.garrison_status(max_horizon=int(config.defense_threat_horizon)).ships.shape[-1]) - 1)
+    if H <= 0:
+        return _empty_entries(device, dtype)
+
+    status = movement.garrison_status(max_horizon=H)
+    ships_at_H = status.ships[:, -1]
+
+    threatened = owned & (ships_at_H < 0)
+    if not bool(threatened.any()):
+        return _empty_entries(device, dtype)
+
+    tgt_indices = threatened.nonzero(as_tuple=False).squeeze(1)
+    src_indices = owned.nonzero(as_tuple=False).squeeze(1)
+    if src_indices.numel() == 0:
+        return _empty_entries(device, dtype)
+
+    d0 = cache.cross_dist[0].to(dtype)
+    src_ships = obs.ships[src_indices].to(dtype)
+    speeds = fleet_speed(src_ships.clamp(min=1.0))
+
+    all_entries = []
+    waves_launched = 0
+
+    for t_i in range(int(tgt_indices.shape[0])):
+        if waves_launched >= int(config.defense_max_waves):
+            break
+        tgt = int(tgt_indices[t_i].item())
+        deficit = float(-ships_at_H[tgt].item())
+        need = deficit * float(config.defense_min_intercept_margin)
+
+        dists = d0[src_indices, tgt]
+        etas = (dists / speeds.clamp(min=1e-6)).ceil()
+
+        valid_src = (
+            (etas <= float(H))
+            & (src_ships > need + float(config.min_ships_to_launch))
+            & (src_indices != tgt)
+        )
+        if not bool(valid_src.any()):
+            continue
+
+        best_local = int(torch.where(valid_src, dists, torch.full_like(dists, 1e9)).argmin().item())
+        best_src = int(src_indices[best_local].item())
+        send_ships = min(float(src_ships[best_local].item()) * 0.6,
+                         need + float(config.min_ships_to_launch))
+        send_ships = max(send_ships, float(config.min_ships_to_launch))
+
+        entry = make_launch_set(
+            source_slots=torch.tensor([[best_src]], dtype=torch.long, device=device),
+            target_slots=torch.tensor([[tgt]], dtype=torch.long, device=device),
+            ships=torch.tensor([[send_ships]], dtype=dtype, device=device),
+            eta=torch.tensor([[float(etas[best_local].item())]], dtype=dtype, device=device),
+            valid=torch.tensor([[True]], dtype=torch.bool, device=device),
+            player_id=pid,
+        )
+        all_entries.append(entry)
+        waves_launched += 1
+
+    if not all_entries:
+        return _empty_entries(device, dtype)
+    return concat_launch_entries(all_entries)
+
+
+def _adaptive_distance_scale(dist: Tensor, cache, obs) -> Tensor:
+    """Per-candidate distance multiplier in (0, 1].
+
+    Scales score by 1 / (1 + dist / ref) where ref = max(median_dist * 0.5, 1.0).
+    Nearer targets get a multiplier close to 1; far targets are softly penalised
+    relative to the current map's typical inter-planet distance.
+    """
+    P = int(obs.P)
+    alive = obs.alive
+    if P > 1 and bool(alive.any()):
+        d0 = cache.cross_dist[0]
+        alive_d = d0[alive][:, alive]
+        median_dist = float(alive_d.float().median().item())
+    else:
+        median_dist = 15.0
+    ref = max(median_dist * 0.5, 1.0)
+    return 1.0 / (1.0 + dist / ref)
+
+
+def _committed_fleet_penalty_mask(
+    *,
+    obs,
+    target_idx: Tensor,
+    memory,
+    config: ProducerLiteConfig,
+) -> Tensor:
+    """Penalise targets that already received a fleet last turn.
+
+    Reads ``memory.committed_targets`` (set by plan_lite_waves after greedy
+    select). Returns a per-target multiplier: committed_fleet_penalty for
+    already-targeted planets, 1.0 otherwise.
+    """
+    P = int(obs.P)
+    device = obs.device
+    dtype = obs.ships.dtype
+    ones = torch.ones(int(target_idx.shape[0]), dtype=dtype, device=device)
+
+    committed = getattr(memory, "committed_targets", None)
+    if committed is None or committed.numel() == 0:
+        return ones
+
+    tgt_abs = target_idx.clamp(0, P - 1)
+    is_committed = torch.isin(tgt_abs, committed.to(device=device))
+    penalty = float(config.committed_fleet_penalty)
+    return torch.where(is_committed, torch.full_like(ones, penalty), ones)
+
+
 def plan_lite_waves(
     *,
     movement: PlanetMovement,
@@ -254,6 +505,7 @@ def plan_lite_waves(
     alive_by_step: Tensor,
     config: ProducerLiteConfig,
     player_count: int,
+    memory=None,
 ):
     """Single-size, single-source attack planner + regroup.
 
@@ -268,6 +520,7 @@ def plan_lite_waves(
     dtype = obs.ships.dtype
     pid = int(obs.player_id)
     step = int(obs_tensors["step"].reshape(-1)[0].item())
+    prod_val = prod.to(dtype)
 
     H_axis = int(garrison_status.ships.shape[-1])
     H = max(H_axis - 1, 0)
@@ -427,6 +680,34 @@ def plan_lite_waves(
             torch.zeros_like(owner_strength),
         )
         score = score + target_bonus_short[cand_tgt_short]
+
+    # Adaptive distance penalty: soft-penalise far targets relative to map scale
+    dist_matrix = cache.cross_dist[0].to(dtype)
+    cand_src_abs = cand_src.squeeze(-1)          # [C]
+    dist = dist_matrix[cand_src_abs, cand_tgt_slot]  # [C]
+    distance_scale = _adaptive_distance_scale(dist, cache, obs)
+    score = score * distance_scale.reshape(score.shape)
+
+    # Shrinking ring conquest multiplier
+    ring_mult = _ring_conquest_multiplier(
+        obs=obs, target_idx=target_idx, config=config, step=step,
+    )
+    score = score * ring_mult[cand_tgt_short].reshape(score.shape)
+
+    # Committed-fleet penalty: down-weight targets already attacked last turn
+    if memory is not None:
+        committed_mult = _committed_fleet_penalty_mask(
+            obs=obs, target_idx=target_idx, memory=memory, config=config,
+        )
+        score = score * committed_mult[cand_tgt_short].reshape(score.shape)
+
+    # Late-game suppression: only hard-kill attacks that literally can't land before game ends
+    remaining = TOTAL_STEPS - step
+    if remaining <= 60:
+        eta_flat = cand_eta.reshape(score.shape)
+        too_late = eta_flat >= float(remaining)
+        score = torch.where(too_late, torch.full_like(score, float("-inf")), score)
+
     score = torch.where(cand_valid, score, torch.full_like(score, float("-inf")))
 
     wave_entries, leftover = _greedy_select(
@@ -436,6 +717,14 @@ def plan_lite_waves(
         cand_is_def=cand_is_def, source_budget=obs.ships.to(dtype).clone(),
         target_exists=target_exists, roi_threshold=float(config.roi_threshold),
     )
+
+    # Track committed targets for next turn's penalty
+    if memory is not None:
+        try:
+            ts = wave_entries.target_slots
+            memory.committed_targets = ts.reshape(-1).unique() if ts.numel() > 0 else torch.zeros(0, dtype=torch.long, device=device)
+        except Exception:
+            memory.committed_targets = torch.zeros(0, dtype=torch.long, device=device)
 
     if not bool(config.enable_regroup):
         return wave_entries
@@ -464,16 +753,26 @@ def run_turn(obs_tensors: dict, *, config: ProducerLiteConfig, player_count: int
         cached_movement=getattr(memory, "movement", None),
     )
     memory.movement = movement
+    step = int(obs_tensors["step"].reshape(-1)[0].item())
+    config = _adjust_config(
+        config, obs=obs, prod=movement.planet_prod, step=step, player_count=int(player_count)
+    )
     cache = build_distance_cache(movement, max_k=int(config.horizon))
     H = int(config.horizon)
     status = movement.garrison_status(max_horizon=H)
     alive_by_step = movement.alive_by_step[: H + 1]
 
+    defense_entries = _build_defense_entries(
+        movement=movement, obs=obs, cache=cache,
+        config=config, player_count=int(player_count),
+    )
     entries = plan_lite_waves(
         movement=movement, obs=obs, obs_tensors=obs_tensors, cache=cache,
         garrison_status=status, prod=movement.planet_prod,
         alive_by_step=alive_by_step, config=config, player_count=int(player_count),
+        memory=memory,
     )
+    entries = concat_launch_entries([defense_entries, entries])
     entries = disambiguate_duplicate_launches(entries)
     launches = infer_planned_launches_from_entries(
         obs_tensors=obs_tensors, movement=movement, entries=entries, player_id=int(obs.player_id),
@@ -499,6 +798,8 @@ CONFIG_4P = dataclasses.replace(
     max_regroup_targets_per_source=8,
     ffa_leader_attack_bonus=0.035,
     ffa_target_prod_bonus=0.08,
+    max_roi=1.50,
+    prod_rush_steps=80,
 )
 
 
@@ -511,11 +812,13 @@ class ProducerLiteMemory:
         self.movement = None
         self.cached_player_count: int | None = None
         self.last_sparse_action_row: dict | None = None
+        self.committed_targets = None
 
     def reset(self) -> None:
         self.movement = None
         self.cached_player_count = None
         self.last_sparse_action_row = None
+        self.committed_targets = None
 
 
 class ProducerLiteRuntime:
