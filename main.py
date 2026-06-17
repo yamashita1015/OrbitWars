@@ -105,6 +105,11 @@ class ProducerLiteConfig:
     defense_threat_horizon: float = 14.0
     defense_min_intercept_margin: float = 1.05
     defense_max_waves: int = 3
+    # Terminal phase (last N turns: all-in attack)
+    terminal_phase_turns: int = 40
+    terminal_roi_threshold: float = 1.0
+    terminal_max_waves_per_turn: int = 9
+    terminal_enable_regroup: bool = False
 
 
 def _movement_config(config: ProducerLiteConfig, *, player_count: int) -> MovementConfig:
@@ -271,6 +276,23 @@ def _suppress_late_candidates(
     neutral_factor = ((float(remaining) - eta) / max(1.0, 80.0)).clamp(min=0.20, max=1.0)
     score = torch.where(is_neutral, score * neutral_factor, score)
     return torch.where(too_late, torch.full_like(score, float("-inf")), score)
+
+
+def _apply_phase_config(config: ProducerLiteConfig, step: int) -> ProducerLiteConfig:
+    """Override config for the terminal phase (last terminal_phase_turns turns).
+
+    Unconditionally lowers ROI to 1.0, raises waves to 9, disables regroup —
+    regardless of score. Applied after _adjust_config so it always takes precedence
+    in the endgame.
+    """
+    if int(step) >= TOTAL_STEPS - int(config.terminal_phase_turns):
+        return dataclasses.replace(
+            config,
+            roi_threshold=float(config.terminal_roi_threshold),
+            max_waves_per_turn=int(config.terminal_max_waves_per_turn),
+            enable_regroup=bool(config.terminal_enable_regroup),
+        )
+    return config
 
 
 def _apply_prod_snowball_boost(
@@ -757,6 +779,7 @@ def run_turn(obs_tensors: dict, *, config: ProducerLiteConfig, player_count: int
     config = _adjust_config(
         config, obs=obs, prod=movement.planet_prod, step=step, player_count=int(player_count)
     )
+    config = _apply_phase_config(config, step)
     cache = build_distance_cache(movement, max_k=int(config.horizon))
     H = int(config.horizon)
     status = movement.garrison_status(max_horizon=H)
